@@ -95,6 +95,36 @@ class LoadForecastDataset(Dataset):
 # ==========================================
 # 2. 模型定义 (DLinear分解 + TiDE编码)
 # ==========================================
+
+# 残差块定义
+class ResBlock(nn.Module):
+    def __init__(self, input_dim, hidden_dim, output_dim, dropout=0.1):
+        super(ResBlock, self).__init__()
+        # 主路径
+        self.linear1 = nn.Linear(input_dim, hidden_dim)
+        self.relu = nn.ReLU()
+        self.linear2 = nn.Linear(hidden_dim, output_dim)
+        self.dropout = nn.Dropout(dropout)
+        
+        # 残差路径：如果输入输出维度不一致，需要一个线性投影
+        if input_dim != output_dim:
+            self.shortcut = nn.Linear(input_dim, output_dim)
+        else:
+            self.shortcut = nn.Identity()
+            
+        # 层归一化
+        self.norm = nn.LayerNorm(output_dim)
+
+    def forward(self, x):
+        res = self.shortcut(x)
+        x = self.linear1(x)
+        x = self.relu(x)
+        x = self.linear2(x)
+        x = self.dropout(x)
+        # 先相加再归一化 (Add & Norm)
+        return self.norm(x + res)
+    
+
 class DLinearTiDE(nn.Module):
     def __init__(self, seq_len, pred_len, n_cov, hidden_dim, dropout, cnn_kernel):
         super(DLinearTiDE, self).__init__()
@@ -107,22 +137,19 @@ class DLinearTiDE(nn.Module):
         self.trend_conv = nn.Conv1d(in_channels=1, out_channels=1, 
                                     kernel_size=cnn_kernel, padding=padding, padding_mode='replicate')
         
-        # 2. TiDE-style Encoder for Covariates & Residuals
+        # 2. TiDE 编码器 (使用残差块)
         # TiDE将时间序列展平后通过Dense层编码
         # 输入维度 = (历史Residual长度) + (历史+未来Covariates长度 * Cov特征数)
         input_dim = seq_len * 1 + (seq_len + pred_len) * n_cov
         
         self.encoder = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout)
+            ResBlock(input_dim, hidden_dim, hidden_dim, dropout),
+            ResBlock(hidden_dim, hidden_dim, hidden_dim, dropout)
         )
         
-        # 3. Decoder for Residual (Seasonal) Component
-        self.decoder = nn.Linear(hidden_dim, pred_len)
+        # 3. TiDE 解码器 (使用残差块)
+        # 将 hidden_dim 映射回 pred_len，内部包含非线性变换
+        self.decoder = ResBlock(hidden_dim, hidden_dim, pred_len, dropout)
         
         # 4. Trend Component Predictor (Linear)
         # 简单的线性映射：历史趋势 -> 未来趋势
@@ -150,8 +177,7 @@ class DLinearTiDE(nn.Module):
         
         # --- Decoding / Prediction ---
         # 预测 Seasonal 部分
-        pred_seasonal = self.decoder(encoded) # [Batch, Pred_Len]
-        pred_seasonal = pred_seasonal.unsqueeze(-1)
+        pred_seasonal = self.decoder(encoded).unsqueeze(-1) # [Batch, Pred_Len]
         
         # 预测 Trend 部分
         trend_flat = trend.reshape(batch_size, -1)
@@ -228,9 +254,9 @@ if __name__ == "__main__":
     # 贝叶斯优化目标函数
     def objective(trial):
         # 搜索空间
-        lr = trial.suggest_loguniform('lr', 1e-4, 1e-2)
+        lr = trial.suggest_float('lr', 1e-4, 1e-2, log=True)
         hidden_dim = trial.suggest_categorical('hidden_dim', [64, 128, 256])
-        dropout = trial.suggest_uniform('dropout', 0.1, 0.5)
+        dropout = trial.suggest_float('dropout', 0.1, 0.5)
         cnn_kernel = trial.suggest_categorical('cnn_kernel', [3, 5, 7, 15, 25])
         
         # 构建数据集与Loader
