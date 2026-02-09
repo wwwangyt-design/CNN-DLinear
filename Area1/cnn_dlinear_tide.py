@@ -13,7 +13,7 @@ import logging
 import os
 
 # 配置日志记录器：同时输出到文件和控制台
-log_filename = "training_log.txt"
+log_filename = "training_log_2.txt"
 if os.path.exists(log_filename):
     os.remove(log_filename) # 每次运行前删除旧日志，如需追加请注释此行
 
@@ -53,21 +53,32 @@ def load_and_process_data(filepath):
     continuous_cols = ['Humidity', 'Temp', 'Apparent_Temp', 'Hour_Sin', 'Hour_Cos', 'Rainfall']
     binary_cols = ['Is_Weekend', 'Is_Holiday', 'Has_Rainfall']
     target_col = 'Load'
+    feature_cols = continuous_cols + binary_cols
     
     # 归一化 (StandardScaler)
     scaler_x = StandardScaler()
     scaler_y = StandardScaler()
+
+    # 先进行数据集切分 (8:2)
+    train_size = int(len(df) * 0.8)
+    train_df = df.iloc[:train_size].copy()
+    test_df = df.iloc[train_size:].copy()
+
+    # 3. 仅在训练集上 FIT，然后同时 TRANSFORM
+    # 处理特征 (X)
+    train_df[feature_cols] = scaler_x.fit_transform(train_df[feature_cols])
+    test_df[feature_cols] = scaler_x.transform(test_df[feature_cols]) # 注意：这里是 transform
+
+    # 处理目标值 (Y)
+    train_df[[target_col]] = scaler_y.fit_transform(train_df[[target_col]])
+    test_df[[target_col]] = scaler_y.transform(test_df[[target_col]]) # 注意：这里是 transform
+
+    # 转换为 numpy
+    train_data = train_df[feature_cols + [target_col]].values.astype(np.float32)
+    test_data = test_df[feature_cols + [target_col]].values.astype(np.float32)
     
-    # 对连续变量进行归一化，0-1变量保持原样或也归一化均可，这里统一归一化以利于神经网络收敛
-    feature_cols = continuous_cols + binary_cols
-    df[feature_cols] = scaler_x.fit_transform(df[feature_cols])
-    df[[target_col]] = scaler_y.fit_transform(df[[target_col]])
-    
-    # 转换为numpy数组: [N, Features + Target]
-    # 特征在前，Target在最后
-    data_array = df[feature_cols + [target_col]].values.astype(np.float32)
     logger.info("数据加载与预处理完成。")
-    return data_array, scaler_y, len(feature_cols)
+    return train_data, test_data, scaler_y, len(feature_cols)
 
 class LoadForecastDataset(Dataset):
     def __init__(self, data, seq_len=96, pred_len=96):
@@ -239,12 +250,7 @@ if __name__ == "__main__":
     BATCH_SIZE = 64
 
     # 加载数据
-    data, scaler_y, n_features = load_and_process_data(FILE_PATH)
-
-    # 数据集切分 (Train: 80%, Test: 20%)
-    train_size = int(len(data) * 0.8)
-    train_data = data[:train_size]
-    test_data = data[train_size:]
+    train_data, test_data, scaler_y, n_features = load_and_process_data(FILE_PATH)
 
     # HPO用的验证集 (从训练集中分出最后10%)
     val_size_hpo = int(len(train_data) * 0.1)
@@ -294,15 +300,15 @@ if __name__ == "__main__":
         
         return mape
 
-    # 执行贝叶斯优化
-    logger.info("开始进行贝叶斯超参数优化...")
-    study = optuna.create_study(direction='minimize')
-    study.optimize(objective, n_trials=10) # 建议设置为10-20次
-    logger.info(f"最佳参数组合: {study.best_params}")
-    logger.info(f"最佳验证集 MAPE: {study.best_value:.4f}%")
+    # # 执行贝叶斯优化
+    # logger.info("开始进行贝叶斯超参数优化...")
+    # study = optuna.create_study(direction='minimize')
+    # study.optimize(objective, n_trials=10) # 建议设置为10-20次
+    # logger.info(f"最佳参数组合: {study.best_params}")
+    # logger.info(f"最佳验证集 MAPE: {study.best_value:.4f}%")
 
     # 使用最佳参数进行最终全量训练
-    best_params = study.best_params
+    best_params = {'lr': 0.0016557890156058321, 'hidden_dim': 128, 'dropout': 0.16342252010253766, 'cnn_kernel': 5}
     full_train_ds = LoadForecastDataset(train_data, SEQ_LEN, PRED_LEN)
     test_ds = LoadForecastDataset(test_data, SEQ_LEN, PRED_LEN)
 
@@ -317,7 +323,7 @@ if __name__ == "__main__":
     criterion = nn.MSELoss()
 
     train_losses, test_losses = [], []
-    EPOCHS = 20 # 最终训练轮数
+    EPOCHS = 15 # 最终训练轮数
 
     logger.info("开始进行最终全量训练...")
     for epoch in range(EPOCHS):
@@ -334,8 +340,8 @@ if __name__ == "__main__":
     plt.plot(test_losses, label='Test Loss')
     plt.title('Training and Test Loss')
     plt.legend()
-    plt.savefig('loss_curve.png')
-    logger.info("损失曲线已保存为 loss_curve.png")
+    plt.savefig('loss_curve_2.png')
+    logger.info("损失曲线已保存为 loss_curve_2.png")
 
     # 计算最终指标
     preds_list, actuals_list = [], []
@@ -357,7 +363,7 @@ if __name__ == "__main__":
         logger.info(f"{k}: {v:.4f}")
 
     # 选择一天进行可视化 (随机选择一个样本)
-    sample_idx = np.random.randint(0, len(preds_inv))
+    sample_idx = 0
     plt.figure(figsize=(12, 6))
     plt.plot(actuals_inv[sample_idx], label='Ground Truth')
     plt.plot(preds_inv[sample_idx], label='Prediction', linestyle='--')
