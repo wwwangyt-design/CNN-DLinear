@@ -5,6 +5,7 @@ from torch.utils.data import Dataset, DataLoader
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
+import seaborn as sns
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import mean_squared_error, r2_score
 import optuna
@@ -13,7 +14,7 @@ import logging
 import os
 
 # 配置日志记录器：同时输出到文件和控制台
-log_filename = "training_log_att.txt"
+log_filename = "training_log_att1.txt"
 if os.path.exists(log_filename):
     os.remove(log_filename) # 每次运行前删除旧日志，如需追加请注释此行
 
@@ -145,8 +146,9 @@ class CrossAttention(nn.Module):
         self.value_proj = nn.Linear(key_dim, hidden_dim)
         self.out_proj = nn.Linear(hidden_dim, query_dim)
         self.scale = np.sqrt(hidden_dim)
+        self.norm = nn.LayerNorm(query_dim)
 
-    def forward(self, query, key_value):
+    def forward(self, query, key_value, return_attn=False):
         # query: [Batch, query_dim] -> 历史编码
         # key_value: [Batch, Pred_Len, key_dim] -> 未来外生变量
         
@@ -169,7 +171,9 @@ class CrossAttention(nn.Module):
         # 4. 映射回原维度并进行残差连接
         # out: [Batch, query_dim]
         out = self.out_proj(context.squeeze(1))
-        return out + query # 残差结构
+        if return_attn:
+            return self.norm(out + query), attn_weights # 返回权重
+        return self.norm(out + query) # 残差结构
     
 
 class DLinearTiDE(nn.Module):
@@ -177,6 +181,7 @@ class DLinearTiDE(nn.Module):
         super(DLinearTiDE, self).__init__()
         self.seq_len = seq_len
         self.pred_len = pred_len
+        self.norm_hist = nn.LayerNorm(hidden_dim)
         
         # 1. 趋势分解 (Trend Decomposition via CNN)
         # 使用Conv1d替代MA，kernel_size需为奇数以方便padding保持维度
@@ -203,7 +208,7 @@ class DLinearTiDE(nn.Module):
         # 简单的线性映射：历史趋势 -> 未来趋势
         self.trend_linear = nn.Linear(seq_len, pred_len)
         
-    def forward(self, x_load, x_cov):
+    def forward(self, x_load, x_cov, return_attn=False):
         # x_load: [Batch, Seq_Len, 1]
         # x_cov: [Batch, Seq_Len + Pred_Len, n_cov]
         batch_size = x_load.shape[0]
@@ -225,11 +230,15 @@ class DLinearTiDE(nn.Module):
         # 仅将历史信息输入 Encoder
         hist_input = torch.cat([seasonal_flat, hist_cov_flat], dim=1)
         hist_encoded = self.hist_encoder(hist_input) # [Batch, hidden_dim]
+        hist_encoded = self.norm_hist(hist_encoded) # 层归一化
         
         # --- 4. Cross-Attention (跨维度注意力融合) ---
         # 用历史状态去 Query 未来的外生变量特征
         # attn_out 将包含“受未来天气/节假日调整后”的历史上下文
-        attn_out = self.cross_attn(hist_encoded, future_cov) # [Batch, hidden_dim]
+        if return_attn:
+            attn_out, weights = self.cross_attn(hist_encoded, future_cov, return_attn=True)
+        else: 
+            attn_out = self.cross_attn(hist_encoded, future_cov) # [Batch, hidden_dim]
         
         # --- 5. Decoding & Recomposition (解码与重组) ---
         pred_seasonal = self.decoder(attn_out).unsqueeze(-1)
@@ -237,6 +246,8 @@ class DLinearTiDE(nn.Module):
         trend_flat = trend.reshape(batch_size, -1)
         pred_trend = self.trend_linear(trend_flat).unsqueeze(-1)
         
+        if return_attn:
+            return pred_seasonal + pred_trend, weights
         return pred_seasonal + pred_trend
 
 # ==========================================
@@ -251,6 +262,7 @@ def train_epoch(model, loader, criterion, optimizer):
         output = model(x_load, x_cov)
         loss = criterion(output, y)
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0) # 梯度裁剪
         optimizer.step()
         losses.append(loss.item())
     return np.mean(losses)
@@ -277,6 +289,93 @@ def calculate_metrics(y_true, y_pred):
     r2 = r2_score(y_true, y_pred)
     
     return {'MAPE': mape, 'WAPE': wape, 'MSE': mse, 'RMSE': rmse, 'R2': r2}
+
+import seaborn as sns
+
+# ==========================================
+# 典型样本筛选与热力图可视化
+# ==========================================
+
+def plot_heatmaps_and_forecasts(model, dataset, scaler_y, device, title_suffix=""):
+    model.eval()
+    # 筛选逻辑：在测试数据中寻找特定特征
+    # 索引参考：0:Humidity, 1:Temp, 6:Is_Weekend
+    data = dataset.data
+    seq_len = dataset.seq_len
+    pred_len = dataset.pred_len
+    
+    # 查找典型日索引
+    # 我们看预测窗口内的特征
+    indices = {}
+    
+    # 1. 寻找最高温和最低温样本 (索引1是Temp)
+    temp_values = []
+    for i in range(len(dataset)):
+        # 计算预测窗口内的平均温度
+        avg_temp = data[i + seq_len : i + seq_len + pred_len, 1].mean()
+        temp_values.append(avg_temp)
+    
+    indices['High_Temp_Day'] = np.argmax(temp_values)
+    indices['Low_Temp_Day'] = np.argmin(temp_values)
+    
+    # 2. 寻找工作日和周末 (索引6是Is_Weekend)
+    # 找预测窗口内全是工作日(min=max=scaled_0)或全是周末(min=max=scaled_1)的
+    is_weekend_col = data[:, 6]
+    weekend_val = is_weekend_col.max()
+    workday_val = is_weekend_col.min()
+
+    # --- 3. 降雨维度 (新增) ---
+    has_rainfall_col = data[:, 8]
+    rainy_val = has_rainfall_col.max() # 1 经过归一化后的值
+    sunny_val = has_rainfall_col.min() # 0 经过归一化后的值
+    
+    for i in range(len(dataset)):
+        win = data[i + seq_len : i + seq_len + pred_len, 6]
+        if np.all(win == workday_val) and 'Workday' not in indices:
+            indices['Workday'] = i
+        if np.all(win == weekend_val) and 'Weekend' not in indices:
+            indices['Weekend'] = i
+        
+        if np.sum(win == rainy_val) > (pred_len // 2) and 'Rainy_Day' not in indices:
+            indices['Rainy_Day'] = i
+        if np.all(win == sunny_val) and 'Sunny_Day' not in indices:
+            indices['Sunny_Day'] = i
+            
+        if len(indices) >= 6: break # 找齐6种典型日后停止
+
+    # 绘图循环
+    for name, idx in indices.items():
+        x_l, x_c, y = dataset[idx]
+        x_l, x_c = x_l.unsqueeze(0).to(device), x_c.unsqueeze(0).to(device)
+        
+        with torch.no_grad():
+            pred, weights = model(x_l, x_c, return_attn=True)
+        
+        # 反归一化
+        pred_inv = scaler_y.inverse_transform(pred.cpu().numpy().reshape(-1, 1)).flatten()
+        true_inv = scaler_y.inverse_transform(y.numpy().reshape(-1, 1)).flatten()
+        attn_weights = weights.cpu().numpy().squeeze() # [Pred_Len]
+        
+        # 创建画布：左边预测曲线，右边热力图
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(18, 5), gridspec_kw={'width_ratios': [2, 1]})
+        
+        # 预测曲线
+        ax1.plot(true_inv, label='Actual', color='blue')
+        ax1.plot(pred_inv, label='Predicted', color='red', linestyle='--')
+        ax1.set_title(f'Forecast: {name}')
+        ax1.legend()
+        
+        # 热力图 (转为 1x96 矩阵)
+        sns.heatmap(attn_weights.reshape(1, -1), ax=ax2, cmap='YlGnBu', cbar=True)
+        ax2.set_title(f'Attention Weights: {name}')
+        ax2.set_xlabel('Future Time Steps')
+        ax2.set_yticks([])
+        
+        plt.tight_layout()
+        plt.savefig(f'analysis_{name}.png')
+        logger.info(f"分析图已保存为 analysis_{name}.png")
+        plt.close()
+
 
 # ==========================================
 # 4. 主程序：数据加载、贝叶斯优化、训练绘图
@@ -339,15 +438,15 @@ if __name__ == "__main__":
         
         return mape
 
-    # 执行贝叶斯优化
-    logger.info("开始进行贝叶斯超参数优化...")
-    study = optuna.create_study(direction='minimize')
-    study.optimize(objective, n_trials=10) # 建议设置为10-20次
-    logger.info(f"最佳参数组合: {study.best_params}")
-    logger.info(f"最佳验证集 MAPE: {study.best_value:.4f}%")
+    # # 执行贝叶斯优化
+    # logger.info("开始进行贝叶斯超参数优化...")
+    # study = optuna.create_study(direction='minimize')
+    # study.optimize(objective, n_trials=10) # 建议设置为10-20次
+    # logger.info(f"最佳参数组合: {study.best_params}")
+    # logger.info(f"最佳验证集 MAPE: {study.best_value:.4f}%")
 
     # 使用最佳参数进行最终全量训练
-    best_params = study.best_params
+    best_params = {'lr': 0.0007070750627712285, 'hidden_dim': 128, 'dropout': 0.36869733880201894, 'cnn_kernel': 15}
     full_train_ds = LoadForecastDataset(train_data, SEQ_LEN, PRED_LEN)
     test_ds = LoadForecastDataset(test_data, SEQ_LEN, PRED_LEN)
 
@@ -379,8 +478,8 @@ if __name__ == "__main__":
     plt.plot(test_losses, label='Test Loss')
     plt.title('Training and Test Loss')
     plt.legend()
-    plt.savefig('loss_curve_att.png')
-    logger.info("损失曲线已保存为 loss_curve_att.png")
+    plt.savefig('loss_curve_att1.png')
+    logger.info("损失曲线已保存为 loss_curve_att1.png")
 
     # 计算最终指标
     preds_list, actuals_list = [], []
@@ -402,7 +501,7 @@ if __name__ == "__main__":
         logger.info(f"{k}: {v:.4f}")
 
     # 选择一天进行可视化 (随机选择一个样本)
-    sample_idx = 0
+    sample_idx = 25
     plt.figure(figsize=(12, 6))
     plt.plot(actuals_inv[sample_idx], label='Ground Truth')
     plt.plot(preds_inv[sample_idx], label='Prediction', linestyle='--')
@@ -410,5 +509,10 @@ if __name__ == "__main__":
     plt.xlabel('Time Steps (15 min)')
     plt.ylabel('Load')
     plt.legend()
-    plt.savefig(f'forecast_sample_att.png')
-    logger.info(f"可视化结果已保存为 forecast_sample_att.png")
+    plt.savefig(f'forecast_sample_att1.png')
+    logger.info(f"可视化结果已保存为 forecast_sample_att1.png")
+
+    # 热力图
+    plot_heatmaps_and_forecasts(final_model, test_ds, scaler_y, device)
+
+    
