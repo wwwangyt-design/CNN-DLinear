@@ -331,14 +331,15 @@ def plot_heatmaps_and_forecasts(model, dataset, scaler_y, device, title_suffix="
     
     for i in range(len(dataset)):
         win = data[i + seq_len : i + seq_len + pred_len, 6]
+        rain_win = data[i + seq_len : i + seq_len + pred_len, 8]
         if np.all(win == workday_val) and 'Workday' not in indices:
             indices['Workday'] = i
         if np.all(win == weekend_val) and 'Weekend' not in indices:
             indices['Weekend'] = i
         
-        if np.sum(win == rainy_val) > (pred_len // 2) and 'Rainy_Day' not in indices:
+        if np.sum(rain_win == rainy_val) > (pred_len // 2) and 'Rainy_Day' not in indices:
             indices['Rainy_Day'] = i
-        if np.all(win == sunny_val) and 'Sunny_Day' not in indices:
+        if np.all(rain_win == sunny_val) and 'Sunny_Day' not in indices:
             indices['Sunny_Day'] = i
             
         if len(indices) >= 6: break # 找齐6种典型日后停止
