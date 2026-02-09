@@ -385,7 +385,7 @@ if __name__ == "__main__":
     FILE_PATH = 'Area2_Data.csv'
     SEQ_LEN = 192  # 过去48小时
     PRED_LEN = 96 # 预测未来24小时
-    BATCH_SIZE = 32
+    BATCH_SIZE = 64
 
     # 加载数据
     train_data, test_data, scaler_y, n_features = load_and_process_data(FILE_PATH)
@@ -398,10 +398,10 @@ if __name__ == "__main__":
     # 贝叶斯优化目标函数
     def objective(trial):
         # 搜索空间
-        lr = trial.suggest_float('lr', 1e-4, 1e-2, log=True)
-        hidden_dim = trial.suggest_categorical('hidden_dim', [64, 128, 256])
-        dropout = trial.suggest_float('dropout', 0.1, 0.5)
-        cnn_kernel = trial.suggest_categorical('cnn_kernel', [3, 5, 7, 15, 25])
+        lr = trial.suggest_float('lr', 5e-5, 3e-3, log=True)
+        hidden_dim = trial.suggest_categorical('hidden_dim', [128, 256, 512])
+        dropout = trial.suggest_float('dropout', 0.1, 0.3)
+        cnn_kernel = trial.suggest_categorical('cnn_kernel', [7, 15, 25, 31, 49])
         
         # 构建数据集与Loader
         train_ds = LoadForecastDataset(train_data_hpo, SEQ_LEN, PRED_LEN)
@@ -412,11 +412,11 @@ if __name__ == "__main__":
         val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
         
         model = DLinearTiDE(SEQ_LEN, PRED_LEN, n_features, hidden_dim, dropout, cnn_kernel).to(device)
-        optimizer = optim.Adam(model.parameters(), lr=lr)
+        optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
         criterion = nn.MSELoss()
         
         # 快速训练几轮以评估
-        for epoch in range(3): 
+        for epoch in range(10): 
             train_epoch(model, train_loader, criterion, optimizer)
         
         # 验证集Loss
@@ -438,15 +438,15 @@ if __name__ == "__main__":
         
         return mape
 
-    # # 执行贝叶斯优化
-    # logger.info("开始进行贝叶斯超参数优化...")
-    # study = optuna.create_study(direction='minimize')
-    # study.optimize(objective, n_trials=10) # 建议设置为10-20次
-    # logger.info(f"最佳参数组合: {study.best_params}")
-    # logger.info(f"最佳验证集 MAPE: {study.best_value:.4f}%")
+    # 执行贝叶斯优化
+    logger.info("开始进行贝叶斯超参数优化...")
+    study = optuna.create_study(direction='minimize')
+    study.optimize(objective, n_trials=15) # 建议设置为10-20次
+    logger.info(f"最佳参数组合: {study.best_params}")
+    logger.info(f"最佳验证集 MAPE: {study.best_value:.4f}%")
 
     # 使用最佳参数进行最终全量训练
-    best_params = {'lr': 0.0007070750627712285, 'hidden_dim': 128, 'dropout': 0.36869733880201894, 'cnn_kernel': 15}
+    best_params = study.best_params
     full_train_ds = LoadForecastDataset(train_data, SEQ_LEN, PRED_LEN)
     test_ds = LoadForecastDataset(test_data, SEQ_LEN, PRED_LEN)
 
@@ -457,11 +457,11 @@ if __name__ == "__main__":
                             best_params['hidden_dim'], 
                             best_params['dropout'], 
                             best_params['cnn_kernel']).to(device)
-    optimizer = optim.Adam(final_model.parameters(), lr=best_params['lr'])
+    optimizer = optim.Adam(final_model.parameters(), lr=best_params['lr'], weight_decay=1e-5)
     criterion = nn.MSELoss()
 
     train_losses, test_losses = [], []
-    EPOCHS = 15 # 最终训练轮数
+    EPOCHS = 40 # 最终训练轮数
 
     logger.info("开始进行最终全量训练...")
     for epoch in range(EPOCHS):
