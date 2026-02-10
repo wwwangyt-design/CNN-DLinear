@@ -383,7 +383,7 @@ def plot_heatmaps_and_forecasts(model, dataset, scaler_y, device, title_suffix="
 # ==========================================
 if __name__ == "__main__":
     # 参数配置
-    FILE_PATH = 'Area2_Data.csv'
+    FILE_PATH = 'Area2_Data.csv'  # 再试一下Area1/Area1_Data.csv
     SEQ_LEN = 192  # 过去48小时
     PRED_LEN = 96 # 预测未来24小时
     BATCH_SIZE = 128
@@ -403,6 +403,7 @@ if __name__ == "__main__":
         hidden_dim = trial.suggest_categorical('hidden_dim', [128, 256, 512])
         dropout = trial.suggest_float('dropout', 0.1, 0.3)
         cnn_kernel = trial.suggest_categorical('cnn_kernel', [7, 15, 25, 31, 49])
+        huber_delta = trial.suggest_float('huber_delta', 0.5, 2.0)
         
         # 构建数据集与Loader
         train_ds = LoadForecastDataset(train_data_hpo, SEQ_LEN, PRED_LEN)
@@ -414,7 +415,7 @@ if __name__ == "__main__":
         
         model = DLinearTiDE(SEQ_LEN, PRED_LEN, n_features, hidden_dim, dropout, cnn_kernel).to(device)
         optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
-        criterion = nn.MSELoss()
+        criterion = nn.HuberLoss(delta=huber_delta)
         
         # 快速训练几轮以评估
         for epoch in range(10): 
@@ -458,11 +459,13 @@ if __name__ == "__main__":
                             best_params['hidden_dim'], 
                             best_params['dropout'], 
                             best_params['cnn_kernel']).to(device)
-    optimizer = optim.Adam(final_model.parameters(), lr=best_params['lr'], weight_decay=1e-5)
-    criterion = nn.MSELoss()
+    optimizer = optim.AdamW(final_model.parameters(), 
+                         lr=best_params['lr'], 
+                         weight_decay=1e-5)
+    criterion = nn.HuberLoss(delta=best_params['huber_delta'])
 
     train_losses, test_losses = [], []
-    EPOCHS = 40 # 最终训练轮数
+    EPOCHS = 50 # 最终训练轮数
 
     logger.info("开始进行最终全量训练...")
     for epoch in range(EPOCHS):
