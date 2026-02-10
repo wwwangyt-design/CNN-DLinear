@@ -51,7 +51,7 @@ def load_and_process_data(filepath):
     df['Rainfall'] = df['Rainfall'].fillna(0)
     
     # 变量分类
-    continuous_cols = ['Humidity', 'Temp', 'Apparent_Temp', 'Hour_Sin', 'Hour_Cos', 'Rainfall']
+    continuous_cols = ['Humidity', 'Temp', 'Apparent_Temp', 'Hour_Sin', 'Hour_Cos', 'Rainfall', 'Lag_96']
     binary_cols = ['Is_Weekend', 'Is_Holiday', 'Has_Rainfall']
     target_col = 'Load'
     feature_cols = continuous_cols + binary_cols
@@ -386,7 +386,7 @@ if __name__ == "__main__":
     FILE_PATH = 'Area2_Data.csv'
     SEQ_LEN = 192  # 过去48小时
     PRED_LEN = 96 # 预测未来24小时
-    BATCH_SIZE = 64
+    BATCH_SIZE = 128
 
     # 加载数据
     train_data, test_data, scaler_y, n_features = load_and_process_data(FILE_PATH)
@@ -502,7 +502,7 @@ if __name__ == "__main__":
         logger.info(f"{k}: {v:.4f}")
 
     # 选择一天进行可视化 (随机选择一个样本)
-    sample_idx = 25
+    sample_idx = 18
     plt.figure(figsize=(12, 6))
     plt.plot(actuals_inv[sample_idx], label='Ground Truth')
     plt.plot(preds_inv[sample_idx], label='Prediction', linestyle='--')
@@ -513,7 +513,7 @@ if __name__ == "__main__":
     plt.savefig(f'forecast_sample_att1.png')
     logger.info(f"可视化结果已保存为 forecast_sample_att1.png")
 
-    # 热力图
-    plot_heatmaps_and_forecasts(final_model, test_ds, scaler_y, device)
+    # # 热力图
+    # plot_heatmaps_and_forecasts(final_model, test_ds, scaler_y, device)
 
     
